@@ -1,0 +1,10 @@
+# Core Data Handling & Processing
+pypdf==4.2.0
+networkx==3.3
+pydantic==2.7.4
+
+# Environment Management
+python-dotenv==1.0.1
+
+# Testing
+pytest==8.2.2

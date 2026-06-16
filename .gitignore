@@ -1,0 +1,16 @@
+# Virtual Environment
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Data & Storage (Crucial for CCBD projects)
+data/raw/
+data/processed/
+.env
+
+# IDEs and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
