@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # ── Config ────────────────────────────────────────────────────────────────────
 
 MAX_HOPS        = 3      # maximum chain length (Claim → Lib → Patent = 2 hops)
-CHAIN_THRESHOLD = 0.50   # minimum product-of-edge-weights to keep a chain
+CHAIN_THRESHOLD = 0.82   # minimum product-of-edge-weights to keep a chain
 TOP_K_PER_CLAIM = 5      # max chains to keep per starting Claim node
 TOP_K_GLOBAL    = 50     # max chains total passed to question_gen
 
@@ -115,20 +115,19 @@ def bfs_hop_chains(
     return paths
 
 
+LENGTH_PENALTY_FACTOR = 0.92   # multiplicative penalty applied per hop beyond 1
+
 def score_chain(G: nx.DiGraph, path: list[str]) -> float:
-    """
-    Score a chain as the product of edge weights along the path.
-    Penalizes longer chains slightly to prefer tight, direct reasoning.
-    """
+   
     score = 1.0
     for i in range(len(path) - 1):
         u, v   = path[i], path[i + 1]
         weight = G[u][v].get("weight", 0.5)
         score *= weight
-    # Slight length penalty: longer chains need proportionally higher edge scores
     hop_count = len(path) - 1
-    score = score ** (1.0 / max(hop_count, 1))   # geometric mean of edge weights
-    return round(score, 4)
+    geo_mean  = score ** (1.0 / max(hop_count, 1))
+    length_penalty = LENGTH_PENALTY_FACTOR ** max(hop_count - 1, 0)
+    return round(geo_mean * length_penalty, 4)
 
 
 def build_provenance(G: nx.DiGraph, path: list[str]) -> dict:

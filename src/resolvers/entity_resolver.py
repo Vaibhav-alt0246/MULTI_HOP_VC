@@ -20,7 +20,7 @@ Usage:
     python src/resolvers/entity_resolver.py
     python src/resolvers/entity_resolver.py --whitepaper data/processed/bitcoin_parsed.json
 """
-
+import re
 import json
 import logging
 import argparse
@@ -109,10 +109,9 @@ def normalize_entity(text: str) -> str:
     # Remove common punctuation but keep hyphens (important for tech terms)
     t = "".join(c if c.isalnum() or c in "-_ " else " " for c in t)
     t = " ".join(t.split())  # collapse whitespace
-    # Expand buzzwords
-    for buzz, canonical in BUZZWORD_MAP.items():
-        if buzz in t:
-            t = t.replace(buzz, canonical)
+    # Expand buzzwords (shared regex map — see whitepaper_parser for matching logic)
+    for pattern, canonical in BUZZWORD_MAP.items():
+        t = re.sub(pattern, canonical, t, flags=re.IGNORECASE)
     return t
 
 
