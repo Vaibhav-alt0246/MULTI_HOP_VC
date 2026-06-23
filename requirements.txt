@@ -1,22 +1,23 @@
-# Core Data Handling & Processing
-pypdf==4.2.0
-networkx==3.3
-pydantic==2.7.4
-spacy==3.7.5
-click==8.1.8
-en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
+# ── PDF extraction ────────────────────────────────────────────────────────────
+pdfplumber>=0.10.0
+pypdf>=3.0.0
+pytesseract>=0.3.10        # OCR fallback (needs system tesseract-ocr)
+pdf2image>=1.16.0          # OCR fallback (needs system poppler-utils)
+Pillow>=10.0.0             # OCR fallback
 
-# Environment Management
-python-dotenv==1.0.1
+# ── NLP / embeddings ─────────────────────────────────────────────────────────
+spacy>=3.7.0               # patent_parser NER (run: python -m spacy download en_core_web_sm)
+sentence-transformers>=2.6.0  # entity_resolver embeddings
+faiss-cpu>=1.7.4           # entity_resolver vector search
 
-# Testing
-pytest==8.2.2
+# ── Graph ─────────────────────────────────────────────────────────────────────
+networkx>=3.2.0            # github_parser + kg_builder + hop_reasoner
 
-# Additional discovered packages (pinned from current environment)
-numpy==1.26.4
-pdfplumber==0.11.10
-pytesseract==0.3.13
-pdf2image==1.17.0
-Pillow==12.2.0
-faiss-cpu==1.14.3
-sentence-transformers==5.6.0
+# ── Data / validation ────────────────────────────────────────────────────────
+pydantic>=2.0.0            # whitepaper_parser schema validation (optional)
+
+# ── LLM API ──────────────────────────────────────────────────────────────────
+anthropic>=0.25.0          # question_gen (set ANTHROPIC_API_KEY env var)
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=8.0.0

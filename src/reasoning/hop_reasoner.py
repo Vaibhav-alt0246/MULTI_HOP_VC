@@ -1,0 +1,348 @@
+"""
+hop_reasoner.py — Multi-Hop Graph Reasoner
+===========================================
+Multi-Hop Reasoning System for VC Technical Due Diligence
+
+Walks the knowledge graph (kg.json) starting from every Claim node,
+using BFS to discover chains up to MAX_HOPS deep. Each chain represents
+a reasoning path: Claim → Library → Patent → LicenceType.
+
+Scores each chain by multiplying edge weights (cosine scores).
+Filters low-confidence chains before passing to question_gen.py.
+
+Output:
+    data/processed/hop_chains.json
+
+Usage:
+    python src/reasoning/hop_reasoner.py
+    python src/reasoning/hop_reasoner.py --kg data/processed/kg.json --max-hops 3
+"""
+
+import json
+import logging
+import argparse
+from pathlib import Path
+from collections import deque
+from dataclasses import dataclass, asdict
+
+import networkx as nx
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+MAX_HOPS        = 3      # maximum chain length (Claim → Lib → Patent = 2 hops)
+CHAIN_THRESHOLD = 0.50   # minimum product-of-edge-weights to keep a chain
+TOP_K_PER_CLAIM = 5      # max chains to keep per starting Claim node
+TOP_K_GLOBAL    = 50     # max chains total passed to question_gen
+
+
+# ── Data model ────────────────────────────────────────────────────────────────
+
+@dataclass
+class HopChain:
+    """A single scored multi-hop reasoning path through the KG."""
+    chain_id: str
+    start_node: str              # always a Claim node
+    path_nodes: list[str]        # ordered list of node IDs
+    path_node_types: list[str]   # node_type for each node in path
+    path_edges: list[str]        # edge_type for each edge in path
+    chain_score: float           # product of edge weights
+    hop_count: int
+    has_licence_conflict: bool   # True if path touches a high-risk LicenceType
+    has_patent_node: bool        # True if path crosses a Patent node
+    provenance: dict             # full metadata for audit trail
+
+
+# ── Graph loader ──────────────────────────────────────────────────────────────
+
+def load_graph(kg_path: Path) -> nx.DiGraph:
+    """Load kg.json back into a NetworkX DiGraph."""
+    data = json.loads(kg_path.read_text(encoding="utf-8"))
+    G = nx.DiGraph()
+
+    for node in data.get("nodes", []):
+        node_id = node.pop("id")
+        G.add_node(node_id, **node)
+
+    for edge in data.get("edges", []):
+        src = edge.pop("source")
+        tgt = edge.pop("target")
+        G.add_edge(src, tgt, **edge)
+
+    logger.info(
+        "Loaded KG: %d nodes, %d edges",
+        G.number_of_nodes(), G.number_of_edges()
+    )
+    return G
+
+
+# ── BFS traversal ─────────────────────────────────────────────────────────────
+
+def bfs_hop_chains(
+    G: nx.DiGraph,
+    start_node: str,
+    max_hops: int = MAX_HOPS,
+) -> list[list[str]]:
+    """
+    BFS from start_node up to max_hops depth.
+    Returns all simple paths (no cycles) as lists of node IDs.
+    Only follows outgoing edges.
+    """
+    # Queue items: (current_node, path_so_far, visited_set)
+    queue   = deque([(start_node, [start_node], {start_node})])
+    paths   = []
+
+    while queue:
+        current, path, visited = queue.popleft()
+
+        # Record this path if it's longer than just the start node
+        if len(path) > 1:
+            paths.append(path[:])
+
+        # Stop expanding if we've hit the hop limit
+        if len(path) - 1 >= max_hops:
+            continue
+
+        for neighbor in G.successors(current):
+            if neighbor not in visited:
+                queue.append((neighbor, path + [neighbor], visited | {neighbor}))
+
+    return paths
+
+
+def score_chain(G: nx.DiGraph, path: list[str]) -> float:
+    """
+    Score a chain as the product of edge weights along the path.
+    Penalizes longer chains slightly to prefer tight, direct reasoning.
+    """
+    score = 1.0
+    for i in range(len(path) - 1):
+        u, v   = path[i], path[i + 1]
+        weight = G[u][v].get("weight", 0.5)
+        score *= weight
+    # Slight length penalty: longer chains need proportionally higher edge scores
+    hop_count = len(path) - 1
+    score = score ** (1.0 / max(hop_count, 1))   # geometric mean of edge weights
+    return round(score, 4)
+
+
+def build_provenance(G: nx.DiGraph, path: list[str]) -> dict:
+    """
+    Build the audit trail for a hop chain.
+    Records every node's metadata and every edge's type + weight.
+    This is the object that proves how the question was generated.
+    """
+    node_details = []
+    for node_id in path:
+        node_data = dict(G.nodes[node_id])
+        node_details.append({
+            "node_id":   node_id,
+            "node_type": node_data.get("node_type"),
+            "label":     node_data.get("label", node_id),
+            "metadata":  {k: v for k, v in node_data.items()
+                          if k not in ("node_type", "label")
+                          and isinstance(v, (str, int, float, bool, type(None)))},
+        })
+
+    edge_details = []
+    for i in range(len(path) - 1):
+        u, v       = path[i], path[i + 1]
+        edge_data  = dict(G[u][v])
+        edge_details.append({
+            "from":      u,
+            "to":        v,
+            "edge_type": edge_data.get("edge_type"),
+            "weight":    edge_data.get("weight"),
+            "entity_a":  edge_data.get("entity_text_a"),
+            "entity_b":  edge_data.get("entity_text_b"),
+        })
+
+    return {
+        "nodes": node_details,
+        "edges": edge_details,
+        "hop_count": len(path) - 1,
+    }
+
+
+# ── Chain classifier ──────────────────────────────────────────────────────────
+
+def classify_chain(G: nx.DiGraph, path: list[str]) -> tuple[bool, bool]:
+    """
+    Returns (has_licence_conflict, has_patent_node).
+    Used to prioritize chains most relevant for VC due diligence questions.
+    """
+    has_conflict = False
+    has_patent   = False
+
+    for node_id in path:
+        node_data = G.nodes[node_id]
+        nt = node_data.get("node_type", "")
+        if nt == "Patent":
+            has_patent = True
+        if nt == "LicenceType" and node_data.get("risk") == "high":
+            has_conflict = True
+        if nt == "Library" and node_data.get("licence_risk") == "high":
+            has_conflict = True
+
+    return has_conflict, has_patent
+
+
+# ── Main reasoner ─────────────────────────────────────────────────────────────
+
+def reason(
+    G: nx.DiGraph,
+    max_hops: int = MAX_HOPS,
+    chain_threshold: float = CHAIN_THRESHOLD,
+    top_k_per_claim: int = TOP_K_PER_CLAIM,
+    top_k_global: int = TOP_K_GLOBAL,
+) -> list[HopChain]:
+    """
+    Run multi-hop reasoning over the full KG.
+    Starts BFS from every Claim node, scores all paths, filters and ranks.
+    """
+    claim_nodes = [
+        n for n, d in G.nodes(data=True)
+        if d.get("node_type") == "Claim"
+    ]
+    logger.info("Starting BFS from %d Claim nodes", len(claim_nodes))
+
+    all_chains: list[HopChain] = []
+    chain_counter = 0
+
+    for claim_node in claim_nodes:
+        paths = bfs_hop_chains(G, claim_node, max_hops=max_hops)
+        scored: list[tuple[float, list[str]]] = []
+
+        for path in paths:
+            score = score_chain(G, path)
+            if score >= chain_threshold:
+                scored.append((score, path))
+
+        # Keep top-K chains per claim, sorted by score descending
+        scored.sort(key=lambda x: x[0], reverse=True)
+        scored = scored[:top_k_per_claim]
+
+        for score, path in scored:
+            chain_counter += 1
+            node_types = [G.nodes[n].get("node_type", "unknown") for n in path]
+            edge_types = [
+                G[path[i]][path[i + 1]].get("edge_type", "unknown")
+                for i in range(len(path) - 1)
+            ]
+            has_conflict, has_patent = classify_chain(G, path)
+            provenance = build_provenance(G, path)
+
+            all_chains.append(HopChain(
+                chain_id=f"chain_{chain_counter:04d}",
+                start_node=claim_node,
+                path_nodes=path,
+                path_node_types=node_types,
+                path_edges=edge_types,
+                chain_score=score,
+                hop_count=len(path) - 1,
+                has_licence_conflict=has_conflict,
+                has_patent_node=has_patent,
+                provenance=provenance,
+            ))
+
+    # Global sort: prioritize high-risk licence conflicts + patent nodes first
+    all_chains.sort(
+        key=lambda c: (
+            c.has_licence_conflict,
+            c.has_patent_node,
+            c.chain_score,
+        ),
+        reverse=True,
+    )
+    all_chains = all_chains[:top_k_global]
+
+    logger.info(
+        "Hop reasoning complete: %d chains kept (threshold=%.2f)",
+        len(all_chains), chain_threshold
+    )
+    return all_chains
+
+
+# ── Output ────────────────────────────────────────────────────────────────────
+
+def save_chains(chains: list[HopChain], output_path: Path) -> None:
+    output = {
+        "metadata": {
+            "total_chains": len(chains),
+            "chains_with_licence_conflict": sum(1 for c in chains if c.has_licence_conflict),
+            "chains_with_patent_node":      sum(1 for c in chains if c.has_patent_node),
+            "avg_chain_score": round(
+                sum(c.chain_score for c in chains) / max(len(chains), 1), 4
+            ),
+            "hop_distribution": {
+                str(h): sum(1 for c in chains if c.hop_count == h)
+                for h in sorted(set(c.hop_count for c in chains))
+            },
+        },
+        "chains": [asdict(c) for c in chains],
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(output, indent=2, ensure_ascii=False),
+        encoding="utf-8"
+    )
+    logger.info("Saved %d hop chains → %s", len(chains), output_path)
+
+
+def print_summary(chains: list[HopChain]) -> None:
+    print(f"\n{'═'*70}")
+    print("  HOP CHAINS SUMMARY")
+    print(f"{'═'*70}")
+    print(f"  Total chains       : {len(chains)}")
+    print(f"  Licence conflicts  : {sum(1 for c in chains if c.has_licence_conflict)}")
+    print(f"  Patent crossings   : {sum(1 for c in chains if c.has_patent_node)}")
+
+    print(f"\n  Top 5 chains:")
+    for chain in chains[:5]:
+        path_str = " → ".join(
+            f"{n}({t})" for n, t in
+            zip(chain.path_nodes, chain.path_node_types)
+        )
+        flags = []
+        if chain.has_licence_conflict:
+            flags.append("LICENCE⚠")
+        if chain.has_patent_node:
+            flags.append("PATENT")
+        flag_str = " ".join(flags)
+        print(f"\n  [{chain.chain_id}] score={chain.chain_score}  {flag_str}")
+        print(f"     {path_str[:90]}")
+        print(f"     edges: {' → '.join(chain.path_edges)}")
+    print(f"{'═'*70}\n")
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Multi-hop BFS reasoner over the VC due-diligence knowledge graph"
+    )
+    parser.add_argument("--kg",      default="data/processed/kg.json")
+    parser.add_argument("--output",  default="data/processed/hop_chains.json")
+    parser.add_argument("--max-hops",    type=int,   default=MAX_HOPS)
+    parser.add_argument("--threshold",   type=float, default=CHAIN_THRESHOLD)
+    parser.add_argument("--top-k",       type=int,   default=TOP_K_GLOBAL)
+    args = parser.parse_args()
+
+    G      = load_graph(Path(args.kg))
+    chains = reason(
+        G,
+        max_hops=args.max_hops,
+        chain_threshold=args.threshold,
+        top_k_global=args.top_k,
+    )
+    print_summary(chains)
+    save_chains(chains, Path(args.output))
+
+
+if __name__ == "__main__":
+    main()
