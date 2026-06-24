@@ -156,15 +156,23 @@ def _add_library_node(G: nx.DiGraph, name: str, meta: dict, source_file: str):
 
 def _add_patent_node(G: nx.DiGraph, patent_id: str, meta: dict, source_file: str):
     node_id = f"patent:{patent_id}"
+    new_context = {
+        "relationship": meta.get("relationship", ""),
+        "tail_entity": meta.get("tail") or meta.get("head", ""),
+        "source_sentence": meta.get("source_sentence", "")[:200],
+    }
     if not G.has_node(node_id):
         G.add_node(node_id,
             node_type="Patent",
             label=patent_id,
-            relationship=meta.get("relationship", ""),
-            tail_entity=meta.get("tail") or meta.get("head", ""),
-            source_sentence=meta.get("source_sentence", "")[:200],
+            relationship=new_context["relationship"],
+            tail_entity=new_context["tail_entity"],
+            source_sentence=new_context["source_sentence"],
             source_file=source_file,
+            matched_contexts=[new_context],
         )
+    else:
+        G.nodes[node_id]["matched_contexts"].append(new_context)
     return node_id
 
 
@@ -247,9 +255,25 @@ def build_knowledge_graph(matches_path: Path) -> nx.DiGraph:
         edge_type = infer_edge_type(domain_a, domain_b, score)
 
         if G.has_edge(node_id_a, node_id_b):
-            # Keep the highest-scoring edge if duplicate
-            if G[node_id_a][node_id_b]["weight"] < score:
-                G[node_id_a][node_id_b]["weight"] = score
+            edge_data = G[node_id_a][node_id_b]
+            # Always append this match to the full contributing-evidence list
+            edge_data.setdefault("all_matches", []).append({
+                "entity_text_a": entity_a,
+                "entity_text_b": entity_b,
+                "cosine_score": score,
+                "normalized_a": prov.get("normalized_a"),
+                "normalized_b": prov.get("normalized_b"),
+            })
+            # Only promote this match to "primary" if it's the new best score
+            if score > edge_data["weight"]:
+                edge_data["weight"] = score
+                edge_data["entity_text_a"] = entity_a
+                edge_data["entity_text_b"] = entity_b
+                edge_data["provenance"] = {
+                    "normalized_a": prov.get("normalized_a"),
+                    "normalized_b": prov.get("normalized_b"),
+                    "cosine_score": score,
+                }
         else:
             G.add_edge(node_id_a, node_id_b,
                 edge_type=edge_type,
@@ -260,7 +284,14 @@ def build_knowledge_graph(matches_path: Path) -> nx.DiGraph:
                     "normalized_a": prov.get("normalized_a"),
                     "normalized_b": prov.get("normalized_b"),
                     "cosine_score": score,
-                }
+                },
+                all_matches=[{
+                    "entity_text_a": entity_a,
+                    "entity_text_b": entity_b,
+                    "cosine_score": score,
+                    "normalized_a": prov.get("normalized_a"),
+                    "normalized_b": prov.get("normalized_b"),
+                }],
             )
             edge_type_counts[edge_type] += 1
 
@@ -285,7 +316,7 @@ def graph_to_json(G: nx.DiGraph) -> dict:
         "edges": [
             {"source": u, "target": v,
              **{k: v2 for k, v2 in d.items()
-                if isinstance(v2, (str, int, float, bool, type(None)))}}
+                if isinstance(v2, (str, int, float, bool, type(None), list, dict))}}
             for u, v, d in G.edges(data=True)
         ],
     }
