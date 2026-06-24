@@ -342,8 +342,14 @@ def build_import_graph(repo_root: Path) -> tuple[nx.DiGraph, dict]:
         if parts[-1] == "__init__":
             parts = parts[:-1]
         module_name = ".".join(parts)
-        internal_modules.add(parts[0])   # top-level package
+        internal_modules.add(parts[0])   # top-level package, e.g. "src"
         internal_modules.add(module_name)
+        # Also register the path WITHOUT the "src" prefix and its own
+        # top-level segment — pipeline.py inserts src/ onto sys.path, so
+        # internal imports happen as "extractors.x" not "src.extractors.x"
+        if len(parts) > 1:
+            internal_modules.add(".".join(parts[1:]))
+            internal_modules.add(parts[1])
         G.add_node(module_name, type="internal", filepath=str(py_file))
 
     # Second pass: extract imports and add edges

@@ -51,7 +51,9 @@ logger = logging.getLogger(__name__)
 # 1. PREPROCESSING  (Paper §3.1 heuristics)
 # ─────────────────────────────────────────────────────────────────────────────
 _SKIP_SECTIONS = re.compile(
-    r"^(background|prior art|brief description of|examples?|embodiments?)",
+    r"^(background|prior art|brief description of|examples?|embodiments?|"
+    r"preamble|title|publication date|assignee|inventors|"
+    r"cpc classifications|number of claims)",
     re.IGNORECASE,
 )
 _BRACKET_NOISE = re.compile(r"[\(\[\{<][^\)\]\}>]{0,80}[\)\]\}>]")
@@ -66,9 +68,15 @@ def clean_patent_text(raw: str) -> str:
 
 
 def split_into_sections(raw: str) -> dict:
+    # strip the "PATENT ID: XXXX" line — it has inline content so it won't
+    # match the header-on-its-own-line pattern below, and would otherwise
+    # leak into PREAMBLE and get tokenized as prose
+    raw = re.sub(r"^PATENT ID:.*$", "", raw, flags=re.MULTILINE)
     pattern = re.compile(
         r"^(ABSTRACT|CLAIMS?|DESCRIPTION|SUMMARY|FIELD|"
-        r"BACKGROUND|DRAWINGS?|EXAMPLES?|EMBODIMENTS?)[:\s]*$",
+        r"BACKGROUND|DRAWINGS?|EXAMPLES?|EMBODIMENTS?|"
+        r"TITLE|PUBLICATION DATE|ASSIGNEE|INVENTORS|"
+        r"CPC CLASSIFICATIONS|NUMBER OF CLAIMS)[:\s]*$",
         re.IGNORECASE | re.MULTILINE,
     )
     parts = pattern.split(raw)

@@ -27,7 +27,6 @@ Usage:
     python src/extractors/whitepaper_parser.py --input data/raw/ --batch
     python src/extractors/whitepaper_parser.py --input data/raw/scan.pdf --ocr-only
 """
-from shared.buzzwords import BUZZWORD_MAP
 from __future__ import annotations
 
 import argparse
@@ -40,6 +39,9 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from shared.buzzwords import BUZZWORD_MAP
 
 # ── PDF extraction backends (graceful degradation) ────────────────────────────
 _PDFPLUMBER_AVAILABLE = False
@@ -58,12 +60,6 @@ try:
     _PYPDF_AVAILABLE = True
 except ImportError:
     pass
-
-if not _PDFPLUMBER_AVAILABLE and not _PYPDF_AVAILABLE:
-    sys.exit(
-        "ERROR: No PDF library found.\n"
-        "Install at least one: pip install pdfplumber   OR   pip install pypdf"
-    )
 
 try:
     import pytesseract
@@ -442,6 +438,12 @@ def _read_pdf(
     Returns (pages_text, metadata, extraction_method).
     Raises ValueError only if ALL tiers fail.
     """
+    if not _PDFPLUMBER_AVAILABLE and not _PYPDF_AVAILABLE:
+        raise ValueError(
+            "No PDF library found. Install at least one: "
+            "pip install pdfplumber OR pip install pypdf"
+        )
+
     if force_ocr:
         log.info("--ocr-only flag set; skipping text-layer extraction")
         return _read_with_ocr(pdf_path)

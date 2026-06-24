@@ -129,6 +129,8 @@ def fetch_patent_fulltext(patent_id: str) -> dict:
     try:
         r = session.get(url, timeout=25)
         r.raise_for_status()
+        r.encoding = "utf-8"   # Google Patents always serves utf-8; requests'
+                                # auto-detection mis-guesses on CJK content
     except Exception as e:
         logger.warning("Fetch failed for %s: %s", pid, e)
         return {}

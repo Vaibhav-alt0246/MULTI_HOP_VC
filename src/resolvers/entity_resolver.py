@@ -118,46 +118,106 @@ def normalize_entity(text: str) -> str:
 # ── Entity extraction from each parser's JSON ─────────────────────────────────
 
 def extract_from_whitepaper(parsed_json: dict, source_file: str) -> list[EntityRecord]:
-    """
-    Pull named entities and buzzwords from whitepaper_parser output.
-    Each claim contributes its entities and buzzword-normalized sentence.
-    """
     records = []
+    seen_texts = set()
+
     for claim in parsed_json.get("technical_claims", []):
-        # Named entities (SHA-256, libp2p, Ethereum, etc.)
+        claim_type = claim.get("claim_type", "general")
+        claim_id   = claim["claim_id"]
+        page       = claim.get("page")
+        sentence   = claim.get("sentence", "")
+
+        # 1. Named entities (original behaviour)
         for entity in claim.get("entities", []):
-            if len(entity) < 3:
+            if len(entity) < 3 or entity.lower() in seen_texts:
                 continue
+            seen_texts.add(entity.lower())
             records.append(EntityRecord(
                 text=entity,
                 normalized=normalize_entity(entity),
                 domain="whitepaper",
-                source_id=claim["claim_id"],
+                source_id=claim_id,
                 source_file=source_file,
-                extra={
-                    "claim_type": claim.get("claim_type"),
-                    "confidence": claim.get("confidence"),
-                    "page": claim.get("page"),
-                }
+                extra={"claim_type": claim_type, "confidence": claim.get("confidence"), "page": page}
             ))
-        # Buzzwords as entities (after normalization these bridge to tech terms)
+
+        # 2. Buzzwords (original behaviour)
         for buzz in claim.get("buzzwords", []):
+            key = buzz.lower()
+            if key in seen_texts:
+                continue
+            seen_texts.add(key)
             records.append(EntityRecord(
                 text=buzz,
                 normalized=normalize_entity(buzz),
                 domain="whitepaper",
-                source_id=claim["claim_id"],
+                source_id=claim_id,
                 source_file=source_file,
-                extra={
-                    "claim_type": claim.get("claim_type"),
-                    "page": claim.get("page"),
-                    "is_buzzword": True,
-                }
+                extra={"claim_type": claim_type, "page": page, "is_buzzword": True}
             ))
+
+        # 3. NEW — use the full claim sentence as an entity record
+        # This captures technical content even when NER misses individual terms
+        if claim_type != "general" and len(sentence) > 20:
+            key = sentence[:50].lower()
+            if key not in seen_texts:
+                seen_texts.add(key)
+                records.append(EntityRecord(
+                    text=sentence[:120],
+                    normalized=normalize_entity(sentence[:120]),
+                    domain="whitepaper",
+                    source_id=claim_id,
+                    source_file=source_file,
+                    extra={"claim_type": claim_type, "confidence": claim.get("confidence"),
+                           "page": page, "is_full_claim": True}
+                ))
+
+        # 4. NEW — extract key noun phrases from sentences using simple chunking
+        # Targets technical terms the regex NER misses
+        tech_phrases = extract_tech_phrases(sentence)
+        for phrase in tech_phrases:
+            key = phrase.lower()
+            if key in seen_texts or len(phrase) < 5:
+                continue
+            seen_texts.add(key)
+            records.append(EntityRecord(
+                text=phrase,
+                normalized=normalize_entity(phrase),
+                domain="whitepaper",
+                source_id=claim_id,
+                source_file=source_file,
+                extra={"claim_type": claim_type, "page": page, "is_extracted_phrase": True}
+            ))
+
     logger.info("Whitepaper: extracted %d entity records", len(records))
     return records
 
 
+def extract_tech_phrases(sentence: str) -> list[str]:
+    """
+    Extract technical noun phrases missed by regex NER.
+    Targets hyphenated terms, protocol names, and compound technical nouns.
+    """
+    phrases = []
+    # Hyphenated tech terms: peer-to-peer, double-spending, proof-of-work
+    hyphenated = re.findall(r'\b[a-z]+(?:-[a-z]+){1,4}\b', sentence.lower())
+    phrases.extend([p for p in hyphenated if len(p) > 6])
+
+    # Capitalised multi-word terms: Merkle Tree, Hash Function, Byzantine Fault
+    capitalised = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', sentence)
+    phrases.extend(capitalised)
+
+    # Technical single words (longer ones likely to be meaningful)
+    tech_singles = re.findall(
+        r'\b(timestamp(?:ing)?|blockchain|cryptograph\w+|hash(?:ing)?|'
+        r'consensus|decentrali[sz]\w+|Byzantine|validator|signature|'
+        r'transaction|broadcast|ledger|protocol|encrypt\w+|nonce|'
+        r'node(?:s)?|mining|proof|verification|distributed)\b',
+        sentence, re.IGNORECASE
+    )
+    phrases.extend(tech_singles)
+
+    return list(set(phrases))
 def extract_from_codebase(codebase_json: dict, source_file: str) -> list[EntityRecord]:
     """
     Pull library names (with categories) from github_parser output.
