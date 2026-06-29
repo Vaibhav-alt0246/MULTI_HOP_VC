@@ -9,8 +9,8 @@ Runs the full pipeline in sequence:
     3. patent_parser       → patent triples JSON
     4. entity_resolver     → cross-domain entity matches JSON
     5. kg_builder          → typed knowledge graph JSON
-    6. hop_reasoner        → scored hop chains JSON
-    7. question_gen        → due-diligence questions JSON  ← deliverable
+    6. path_reasoner       → scored hop chains JSON
+    7. generation.question_gen → due-diligence questions JSON  ← deliverable
 
 Logs latency at every stage. This is your Phase 3 optimization map:
 whichever stage is slowest is where to tune first.
@@ -214,13 +214,13 @@ def run_kg_builder(
         return None
 
 
-def run_hop_reasoner(
+def run_path_reasoner(
     kg_path:    Path,
     output_dir: Path,
     max_hops:   int   = 3,
     threshold:  float = 0.50,
 ) -> Optional[Path]:
-    from reasoning.hop_reasoner import load_graph, reason, save_chains
+    from reasoning.path_reasoner import load_graph, reason, save_chains
     out = output_dir / "hop_chains.json"
     try:
         G      = load_graph(kg_path)
@@ -234,7 +234,7 @@ def run_hop_reasoner(
         )
         return out
     except Exception as e:
-        logger.error("hop_reasoner failed: %s", e, exc_info=True)
+        logger.error("path_reasoner failed: %s", e, exc_info=True)
         return None
 
 
@@ -244,7 +244,7 @@ def run_question_gen(
     dry_run:       bool          = False,
     max_questions: Optional[int] = None,
 ) -> Optional[Path]:
-    from reasoning.question_gen import generate_questions, save_questions, print_questions
+    from generation.question_gen import generate_questions, save_questions, print_questions
     out = output_dir / "questions.json"
     try:
         questions = generate_questions(
@@ -412,9 +412,9 @@ def run_pipeline(args: argparse.Namespace) -> bool:
         logger.error("Pipeline aborted: kg_builder failed")
         return False
 
-    # ── Stage 6: Hop reasoner ─────────────────────────────────────────────
-    timer.start("hop_reasoner")
-    chains_json = run_hop_reasoner(
+    # ── Stage 6: Path reasoner ────────────────────────────────────────────
+    timer.start("path_reasoner")
+    chains_json = run_path_reasoner(
         kg_path=kg_json,
         output_dir=output_dir,
         max_hops=args.max_hops,
@@ -422,8 +422,33 @@ def run_pipeline(args: argparse.Namespace) -> bool:
     )
     timer.stop()
     if not chains_json:
-        logger.error("Pipeline aborted: hop_reasoner failed")
+        logger.error("Pipeline aborted: path_reasoner failed")
         return False
+
+    # ── Stage 7b: Export structured evidence ─────────────────────────────
+    timer.start("evidence_export")
+    from reasoning.path_reasoner import DynamicPathReasoner
+    dr = DynamicPathReasoner(output_dir.parent)
+    dr.export_evidence()
+    timer.stop()
+
+    # ── Stage 7c: Contradiction detection ─────────────────────────────────
+    timer.start("contradiction_detector")
+    from reasoning.contradiction_detector import detect_contradictions
+    detect_contradictions(output_dir.parent)
+    timer.stop()
+
+    # ── Stage 8: Risk analyzer ────────────────────────────────────────────
+    timer.start("risk_analyzer")
+    from scoring.risk_analyzer import RiskAnalyzer
+    RiskAnalyzer(output_dir.parent).analyze_evidence()
+    timer.stop()
+
+    # ── Stage 9: Explainability audit ─────────────────────────────────────
+    timer.start("explainability")
+    from audit.explainability_engine import explain
+    explain(output_dir.parent)
+    timer.stop()
 
     # ── Stage 7: Question generation ──────────────────────────────────────
     timer.start("question_gen")
@@ -482,9 +507,9 @@ def main():
     parser.add_argument("--resolver-threshold", type=float, default=0.78,
                         help="Cosine similarity threshold for entity matching (default: 0.78)")
     parser.add_argument("--chain-threshold",    type=float, default=0.50,
-                        help="Min chain score for hop_reasoner (default: 0.50)")
+                        help="Min chain score for path_reasoner (default: 0.50)")
     parser.add_argument("--max-hops",           type=int,   default=3,
-                        help="Max BFS depth in hop_reasoner (default: 3)")
+                        help="Max BFS depth in path_reasoner (default: 3)")
     parser.add_argument("--max-questions",      type=int,   default=None,
                         help="Limit questions generated (useful for testing)")
     # Flags

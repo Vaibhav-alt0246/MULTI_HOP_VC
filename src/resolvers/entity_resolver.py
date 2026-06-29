@@ -31,6 +31,8 @@ from typing import Optional
 
 import faiss
 from sentence_transformers import SentenceTransformer
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -273,7 +275,16 @@ def extract_from_patents(patent_json: dict, source_file: str) -> list[EntityReco
     Embeds 'head relationship tail' as a unit for richer context.
     """
     records = []
-    for triple in patent_json.get("triples", []):
+    triples = patent_json.get("triples", [])
+
+    # Cap at 1500 triples to prevent memory overflow during embedding on MPS
+    if len(triples) > 1500:
+        logger.warning(
+            "Capping patent triples from %d to 1500 for memory safety", len(triples)
+        )
+        triples = triples[:1500]
+
+    for triple in triples:
         head = triple.get("head", "").strip()
         tail = triple.get("tail", "").strip()
         rel  = triple.get("relationship", "").strip()[:MAX_REL_LEN]
@@ -282,7 +293,6 @@ def extract_from_patents(patent_json: dict, source_file: str) -> list[EntityReco
         if not head or len(head) < 3:
             continue
 
-        # Embed head with relationship context: "routing module comprises hash table"
         head_context = f"{head} {rel} {tail}".strip()
         records.append(EntityRecord(
             text=head,
@@ -411,7 +421,7 @@ def resolve_entities(
 
     # ── 3. Embed all entity pools ──────────────────────────────────────────
     logger.info("Loading embedding model: %s", MODEL_NAME)
-    model = SentenceTransformer(MODEL_NAME)
+    model = SentenceTransformer(MODEL_NAME, device="cpu")
 
     def embed(records: list[EntityRecord]) -> np.ndarray:
         texts = [r.normalized for r in records]

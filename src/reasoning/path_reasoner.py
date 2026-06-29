@@ -1,5 +1,5 @@
 """
-hop_reasoner.py — Multi-Hop Graph Reasoner
+path_reasoner.py — Multi-Hop Graph Reasoner
 ===========================================
 Multi-Hop Reasoning System for VC Technical Due Diligence
 
@@ -8,19 +8,20 @@ using BFS to discover chains up to MAX_HOPS deep. Each chain represents
 a reasoning path: Claim → Library → Patent → LicenceType.
 
 Scores each chain by multiplying edge weights (cosine scores).
-Filters low-confidence chains before passing to question_gen.py.
+Filters low-confidence chains before passing to generation/question_gen.py.
 
 Output:
     data/processed/hop_chains.json
 
 Usage:
-    python src/reasoning/hop_reasoner.py
-    python src/reasoning/hop_reasoner.py --kg data/processed/kg.json --max-hops 3
+    python src/reasoning/path_reasoner.py
+    python src/reasoning/path_reasoner.py --kg data/processed/kg.json --max-hops 3
 """
 
 import json
 import logging
 import argparse
+import itertools
 from pathlib import Path
 from collections import deque
 from dataclasses import dataclass, asdict
@@ -36,7 +37,7 @@ logger = logging.getLogger(__name__)
 # ── Config ────────────────────────────────────────────────────────────────────
 
 MAX_HOPS        = 3      # maximum chain length (Claim → Lib → Patent = 2 hops)
-CHAIN_THRESHOLD = 0.82   # minimum product-of-edge-weights to keep a chain
+CHAIN_THRESHOLD = 0.45   # minimum product-of-edge-weights to keep a chain
 TOP_K_PER_CLAIM = 5      # max chains to keep per starting Claim node
 TOP_K_GLOBAL    = 50     # max chains total passed to question_gen
 
@@ -317,6 +318,131 @@ def print_summary(chains: list[HopChain]) -> None:
         print(f"     {path_str[:90]}")
         print(f"     edges: {' → '.join(chain.path_edges)}")
     print(f"{'═'*70}\n")
+
+
+class DynamicPathReasoner:
+    """
+    Ujwal-style dynamic traversal over a fused graph.
+
+    This class exports ``structured_evidence.json`` for downstream scoring. It
+    supports both this repo's ``kg.json`` node-link shape and the older
+    ``fused_knowledge_graph.json`` shape.
+    """
+
+    def __init__(self, data_dir: Path):
+        self.data_dir = data_dir
+        self.G = nx.DiGraph()
+        self.load_graph()
+
+    def _resolve_graph_path(self) -> Path:
+        kg_path = self.data_dir / "processed" / "kg.json"
+        fused_path = self.data_dir / "processed" / "fused_knowledge_graph.json"
+        return kg_path if kg_path.exists() else fused_path
+
+    def load_graph(self) -> None:
+        graph_path = self._resolve_graph_path()
+        if not graph_path.exists():
+            logger.error("Graph not found. Expected kg.json or fused_knowledge_graph.json.")
+            return
+
+        data = json.loads(graph_path.read_text(encoding="utf-8"))
+        for node in data.get("nodes", []):
+            self.G.add_node(node["id"], **node)
+        for edge in data.get("edges", data.get("links", [])):
+            self.G.add_edge(edge["source"], edge["target"], **edge)
+
+        logger.info(
+            "Loaded graph for dynamic traversal: %d nodes, %d edges",
+            self.G.number_of_nodes(),
+            self.G.number_of_edges(),
+        )
+
+    def calculate_path_confidence(self, path: list[str]) -> float:
+        """Calculate confidence from edge weights/similarity with path decay."""
+        base_confidence = 1.0
+        for i in range(len(path) - 1):
+            edge_data = self.G.get_edge_data(path[i], path[i + 1], default={})
+            sim_score = edge_data.get("similarity", edge_data.get("weight", 0.95))
+            base_confidence *= sim_score
+
+        length_penalty = 0.9 ** max(len(path) - 2, 0)
+        return round(base_confidence * length_penalty, 3)
+
+    def _node_role(self, node_id: str) -> str:
+        attrs = self.G.nodes[node_id]
+        return attrs.get("label") or attrs.get("node_type") or ""
+
+    def discover_evidence_chains(self, max_depth: int = 4, per_pair_limit: int = 50) -> list[dict]:
+        """
+        Find simple paths from claims to patent/license risk nodes.
+
+        Paths are sorted by confidence so downstream stages can consume the
+        highest-signal evidence first.
+        """
+        logger.info("Discovering dynamic evidence chains (max depth=%d)", max_depth)
+        claims = [
+            n for n, d in self.G.nodes(data=True)
+            if d.get("label") == "Marketing_Claim" or d.get("node_type") == "Claim"
+        ]
+        risk_nodes = [
+            n for n, d in self.G.nodes(data=True)
+            if d.get("label") in ["Patent_Concept", "OpenSource_License"]
+            or d.get("node_type") in ["Patent", "LicenceType"]
+        ]
+
+        evidence_objects: list[dict] = []
+        for claim in claims:
+            for risk_node in risk_nodes:
+                try:
+                    paths = list(itertools.islice(
+                        nx.all_simple_paths(
+                            self.G,
+                            source=claim,
+                            target=risk_node,
+                            cutoff=max_depth,
+                        ),
+                        per_pair_limit,
+                    ))
+                except (nx.NodeNotFound, nx.NetworkXError, nx.NetworkXNoPath):
+                    continue
+
+                for path in paths:
+                    risk_role = self._node_role(risk_node)
+                    if risk_role in {"Patent_Concept", "Patent"}:
+                        risk_type = "IP Overlap"
+                    elif risk_role in {"OpenSource_License", "LicenceType"}:
+                        risk_type = "Commercial License"
+                    else:
+                        risk_type = risk_role or "Unknown"
+
+                    claim_attrs = self.G.nodes[claim]
+                    evidence_objects.append({
+                        "claim_id": claim,
+                        "claim_text": (
+                            claim_attrs.get("full_text")
+                            or claim_attrs.get("text")
+                            or claim_attrs.get("label")
+                            or claim
+                        ),
+                        "risk_node": risk_node,
+                        "risk_type": risk_type,
+                        "path_length": len(path) - 1,
+                        "confidence_score": self.calculate_path_confidence(path),
+                        "reasoning_path": path,
+                    })
+
+        evidence_objects.sort(key=lambda x: x["confidence_score"], reverse=True)
+        return evidence_objects
+
+    def export_evidence(self) -> list[dict]:
+        evidence_chains = self.discover_evidence_chains()
+        output_path = self.data_dir / "processed" / "structured_evidence.json"
+        output_path.write_text(
+            json.dumps({"evidence_objects": evidence_chains}, indent=2),
+            encoding="utf-8",
+        )
+        logger.info("Exported %d structured evidence objects to %s", len(evidence_chains), output_path)
+        return evidence_chains
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
