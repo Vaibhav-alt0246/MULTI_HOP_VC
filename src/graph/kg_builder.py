@@ -11,7 +11,7 @@ Node types:   Claim | Library | Patent | LicenceType
 Edge types:   implements · cites · conflicts_with · licenced_under · similar_to
 
 Output:
-    data/processed/kg.json          (node-link format for hop_reasoner)
+    data/processed/kg.json          (node-link format for path_reasoner)
     data/processed/kg_summary.json  (human-readable stats)
 
 Usage:
@@ -22,10 +22,19 @@ Usage:
 import json
 import logging
 import argparse
+import sys
 from pathlib import Path
 from collections import defaultdict
 
 import networkx as nx
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from shared.schema import (
+    EDGE_LICENSED_UNDER,
+    EDGE_POTENTIALLY_IMPLEMENTED_BY,
+    EDGE_REQUIRES_IP_REVIEW,
+    EDGE_SUPPORTS,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -101,19 +110,18 @@ COMMON_LIBRARY_LICENCES = {
 def infer_edge_type(domain_a: str, domain_b: str, score: float) -> str:
     """
     Infer a semantic edge label from the two domains being connected.
-    This is the typed relationship that hop_reasoner will traverse.
+    This is the typed relationship that path_reasoner will traverse.
     """
     pair = tuple(sorted([domain_a, domain_b]))
     if pair == ("codebase", "whitepaper"):
-        return "implements"       # startup's code implements a claimed technology
+        return EDGE_POTENTIALLY_IMPLEMENTED_BY
     if pair == ("patent", "whitepaper"):
-        return "cites"            # whitepaper claim references a patent concept
+        return EDGE_REQUIRES_IP_REVIEW
     if pair == ("codebase", "patent"):
-        # High similarity = likely conflict; lower = general relation
         if score >= 0.88:
-            return "conflicts_with"
-        return "related_to"
-    return "similar_to"
+            return EDGE_REQUIRES_IP_REVIEW
+        return EDGE_SUPPORTS
+    return EDGE_SUPPORTS
 
 
 # ── Node builders ─────────────────────────────────────────────────────────────
@@ -148,7 +156,7 @@ def _add_library_node(G: nx.DiGraph, name: str, meta: dict, source_file: str):
             _add_licence_node(G, licence)
             if not G.has_edge(name, licence):
                 G.add_edge(name, licence,
-                    edge_type="licenced_under",
+                    edge_type=EDGE_LICENSED_UNDER,
                     weight=1.0,
                     risk=risk,
                 )
@@ -197,7 +205,7 @@ def build_knowledge_graph(matches_path: Path) -> nx.DiGraph:
       1. Add node A (typed by domain)
       2. Add node B (typed by domain)
       3. Add directed edge A → B with inferred type + cosine score as weight
-      4. For Library nodes: add LicenceType node + licenced_under edge
+      4. For Library nodes: add LicenceType node + LICENSED_UNDER edge
     """
     data = json.loads(matches_path.read_text(encoding="utf-8"))
     matches = data.get("matches", [])
@@ -310,7 +318,7 @@ def graph_to_json(G: nx.DiGraph) -> dict:
         "directed": True,
         "nodes": [
             {"id": n, **{k: v for k, v in d.items()
-                         if isinstance(v, (str, int, float, bool, type(None)))}}
+                         if isinstance(v, (str, int, float, bool, type(None), list, dict))}}
             for n, d in G.nodes(data=True)
         ],
         "edges": [

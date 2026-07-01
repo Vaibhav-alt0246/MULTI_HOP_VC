@@ -5,8 +5,19 @@ __pycache__/
 *.pyc
 
 # Data & Storage (Crucial for CCBD projects)
-data/raw/
-data/processed/
+data/raw/*
+!data/raw/.gitkeep
+!data/raw/patents/
+data/raw/patents/*
+!data/raw/patents/.gitkeep
+!data/raw/pitch_decks/
+data/raw/pitch_decks/*
+!data/raw/pitch_decks/.gitkeep
+!data/raw/repositories/
+data/raw/repositories/*
+!data/raw/repositories/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
 .env
 
 # IDEs and OS

@@ -3,7 +3,7 @@ question_gen.py — Adversarial Question Generator
 =================================================
 Multi-Hop Reasoning System for VC Technical Due Diligence
 
-Takes hop_chains.json (from hop_reasoner.py) and calls an LLM to generate
+Takes hop_chains.json (from path_reasoner.py) and calls an LLM to generate
 one pointed, adversarial due-diligence question per chain. Every question
 is returned with its full provenance audit trail.
 
@@ -14,9 +14,9 @@ Usage:
     pip install anthropic
     export ANTHROPIC_API_KEY=your_key_here
 
-    python src/reasoning/question_gen.py
-    python src/reasoning/question_gen.py --chains data/processed/hop_chains.json
-    python src/reasoning/question_gen.py --dry-run   # prints prompts, no API call
+    python src/generation/question_gen.py
+    python src/generation/question_gen.py --chains data/processed/hop_chains.json
+    python src/generation/question_gen.py --dry-run   # prints prompts, no API call
 """
 
 import os
@@ -192,51 +192,89 @@ def build_audit_trail(chain: dict) -> list[dict]:
 
 def call_llm(prompt: str, dry_run: bool = False) -> Optional[str]:
     """
-    Call the Anthropic API with retry logic.
-    Returns the generated question string, or None on failure.
+    Call LLM with automatic fallback:
+    - If ANTHROPIC_API_KEY is set → use Claude API
+    - If not set → use Ollama phi3 locally (free)
+    - If dry_run → print prompt and return placeholder
     """
     if dry_run:
         logger.info("[DRY RUN] Prompt:\n%s", prompt)
         return "[DRY RUN] What specific measures has your team taken to ensure that your use of [library] complies with its [licence] licence given your commercial deployment plans?"
 
-    try:
-        import anthropic
-    except ImportError:
-        raise SystemExit(
-            "anthropic package not found.\n"
-            "Install: pip install anthropic\n"
-            "Then:    export ANTHROPIC_API_KEY=your_key"
-        )
-
     api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise SystemExit(
-            "ANTHROPIC_API_KEY environment variable not set.\n"
-            "Run: export ANTHROPIC_API_KEY=your_key"
-        )
 
-    client = anthropic.Anthropic(api_key=api_key)
+    # ── Path A: Anthropic Claude API ──────────────────────────────────────
+    if api_key:
+        try:
+            import anthropic
+        except ImportError:
+            raise SystemExit(
+                "anthropic package not found.\n"
+                "Install: pip install anthropic"
+            )
+
+        client = anthropic.Anthropic(api_key=api_key)
+        for attempt in range(1, RETRY_ATTEMPTS + 1):
+            try:
+                response = client.messages.create(
+                    model=MODEL,
+                    max_tokens=MAX_TOKENS,
+                    system=SYSTEM_PROMPT,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                text = response.content[0].text.strip()
+                if not text.endswith("?"):
+                    text = text.rstrip(".") + "?"
+                return text
+            except Exception as e:
+                logger.warning("API call attempt %d/%d failed: %s", attempt, RETRY_ATTEMPTS, e)
+                if attempt < RETRY_ATTEMPTS:
+                    time.sleep(RETRY_DELAY * attempt)
+
+        logger.error("All %d API attempts failed for this chain", RETRY_ATTEMPTS)
+        return None
+
+    # ── Path B: Ollama phi3 local fallback ────────────────────────────────
+    logger.info("No ANTHROPIC_API_KEY found — using Ollama phi3 locally")
+    import urllib.request
+    import json as _json
+
+    full_prompt = f"{SYSTEM_PROMPT}\n\n{prompt}"
+    payload = _json.dumps({
+        "model": "phi3",
+        "prompt": full_prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.7,
+            "num_predict": MAX_TOKENS,
+        }
+    }).encode()
 
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
-            response = client.messages.create(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": prompt}],
+            req = urllib.request.Request(
+                "http://127.0.0.1:11434/api/generate",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST"
             )
-            text = response.content[0].text.strip()
-            # Sanity check: must end with a question mark
+            with urllib.request.urlopen(req, timeout=60) as r:
+                data = _json.loads(r.read().decode())
+            text = data.get("response", "").strip()
+            if not text:
+                raise ValueError("Empty response from Ollama")
             if not text.endswith("?"):
                 text = text.rstrip(".") + "?"
+            logger.info("Ollama phi3 responded successfully")
             return text
-
         except Exception as e:
-            logger.warning("API call attempt %d/%d failed: %s", attempt, RETRY_ATTEMPTS, e)
+            logger.warning(
+                "Ollama attempt %d/%d failed: %s", attempt, RETRY_ATTEMPTS, e
+            )
             if attempt < RETRY_ATTEMPTS:
                 time.sleep(RETRY_DELAY * attempt)
 
-    logger.error("All %d API attempts failed for this chain", RETRY_ATTEMPTS)
+    logger.error("Ollama failed after %d attempts — is ollama serve running?", RETRY_ATTEMPTS)
     return None
 
 
